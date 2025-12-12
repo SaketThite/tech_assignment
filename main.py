@@ -13,6 +13,10 @@ from deepgram.extensions.types.sockets import (
 from deepgram.extensions.types.sockets.listen_v1_results_event import (
     ListenV1ResultsEvent,
 )
+from deepgram.extensions.types.sockets.listen_v1_utterance_end_event import (
+    ListenV1UtteranceEndEvent,
+)
+
 from openai import OpenAI
 from dotenv import load_dotenv
 import pyaudio
@@ -46,7 +50,9 @@ class VoiceAssistant:
         self.deepgram_stt = None
         self.deepgram_connection = None
         self.is_processing = False
-        self.current_transcript = ""
+        
+        self.transcript_parts = []
+        
         self.event_loop = None
         self.audio = pyaudio.PyAudio()
         self.is_listening = False
@@ -55,6 +61,7 @@ class VoiceAssistant:
         try:
             self.event_loop = asyncio.get_event_loop()
 
+            
             self.deepgram_connection = deepgram.listen.v1.connect(
                 model="nova-2",
                 language="en-US",
@@ -63,14 +70,17 @@ class VoiceAssistant:
                 encoding="linear16",
                 sample_rate=str(SAMPLE_RATE),
                 channels=str(CHANNELS),
+                utterance_end_ms=3000, 
             )
 
             self.deepgram_stt = self.deepgram_connection.__enter__()
 
             assistant = self
 
+            
             def on_message(message: ListenV1SocketClientResponse) -> None:
                 try:
+                    
                     if isinstance(message, ListenV1ResultsEvent):
                         if hasattr(message, "channel") and message.channel:
                             if (
@@ -79,24 +89,36 @@ class VoiceAssistant:
                             ):
                                 sentence = message.channel.alternatives[0].transcript
                                 if len(sentence.strip()) > 0:
-                                    is_final = getattr(message, "is_final", True)
+                                    is_final = getattr(message, "is_final", False)
+                                    
                                     if is_final:
-                                        assistant.current_transcript = sentence
-                                        logger.info(f"Final transcript: {sentence}")
-                                        if (
-                                            assistant.event_loop
-                                            and assistant.event_loop.is_running()
-                                        ):
-                                            asyncio.run_coroutine_threadsafe(
-                                                assistant.process_with_openai(),
-                                                assistant.event_loop,
-                                            )
-                                        else:
-                                            logger.warning(
-                                                "Event loop not available, cannot process with OpenAI"
-                                            )
+                                        assistant.transcript_parts.append(sentence)
+                                        logger.info(f"Buffered transcript part: {sentence}")
                                     else:
                                         logger.debug(f"Interim: {sentence}")
+
+                    elif isinstance(message, ListenV1UtteranceEndEvent):
+                        logger.info("Utterance End detected (Silence).")
+                        
+                        if assistant.transcript_parts:
+                            full_sentence = " ".join(assistant.transcript_parts).strip()
+                            assistant.transcript_parts = [] # Reset buffer
+                            
+                            logger.info(f"Sending full thought to OpenAI: {full_sentence}")
+                            
+                            if (
+                                assistant.event_loop
+                                and assistant.event_loop.is_running()
+                            ):
+                                asyncio.run_coroutine_threadsafe(
+                                    assistant.process_with_openai(full_sentence),
+                                    assistant.event_loop,
+                                )
+                            else:
+                                logger.warning("Event loop not available for OpenAI processing")
+                        else:
+                            logger.debug("Utterance End received but buffer was empty.")
+                            
                 except Exception as e:
                     logger.error(f"Error in on_message handler: {e}")
 
@@ -107,9 +129,9 @@ class VoiceAssistant:
                 logger.info("Deepgram STT connection closed")
                 assistant.deepgram_stt = None
 
-            self.deepgram_stt.on(
-                EventType.OPEN, lambda _: logger.info("Deepgram STT connection opened")
-            )
+            
+            self.deepgram_stt.on(EventType.OPEN, lambda _: logger.info("Deepgram STT connection opened"))
+            
             self.deepgram_stt.on(EventType.MESSAGE, on_message)
             self.deepgram_stt.on(EventType.ERROR, on_error)
             self.deepgram_stt.on(EventType.CLOSE, on_close)
@@ -135,6 +157,7 @@ class VoiceAssistant:
             self.deepgram_stt = None
             self.deepgram_connection = None
             return False
+        
 
     def start_microphone_capture(self):
         self.is_listening = True
@@ -172,16 +195,15 @@ class VoiceAssistant:
         capture_thread_obj.start()
         return capture_thread_obj
 
-    async def process_with_openai(self):
-        if not self.current_transcript.strip() or self.is_processing:
+    
+    async def process_with_openai(self, text):
+        if not text.strip() or self.is_processing:
             return
 
         self.is_processing = True
-        transcript = self.current_transcript.strip()
-        self.current_transcript = ""
-
+        
         try:
-            logger.info(f"Processing with OpenAI: {transcript}")
+            logger.info(f"Processing with OpenAI: {text}")
 
             stream = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -190,7 +212,7 @@ class VoiceAssistant:
                         "role": "system",
                         "content": "You are a helpful assistant. Keep responses concise and conversational, suitable for voice interaction.",
                     },
-                    {"role": "user", "content": transcript},
+                    {"role": "user", "content": text},
                 ],
                 stream=True,
                 temperature=0.7,
