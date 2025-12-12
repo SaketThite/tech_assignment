@@ -160,3 +160,7 @@ Fork this repository. Then make changes in the code and send invitation to the f
 
 This project is provided as-is for educational and development purposes.
 
+Modification 1
+The deepgarm package+API has the ability to tune into pauses when configured to do so. A parameter can be added , 
+utterance_end_ms, which takes in a number of milliseconds to wait before considering a sentence as finished.
+Other changes are done to accomodate this feature, namely keeping the speech transcript in an array , and changing the default value of isfinal to false. Coupled with this we added code to handle event, ListenV1UtteranceEndEvent, to consolidate all the chunks of speech with pauses and send them to Open AI.
